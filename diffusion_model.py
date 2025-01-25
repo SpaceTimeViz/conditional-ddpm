@@ -8,6 +8,7 @@ from tqdm import tqdm
 import os
 from models import ContextUnet
 from utils import SpriteDataset, generate_animation
+import matplotlib.pyplot as plt
 
 
 
@@ -22,10 +23,10 @@ class DiffusionModel(nn.Module):
         self.create_dirs(self.file_dir)
 
     def train(self, batch_size=64, n_epoch=32, lr=1e-3, timesteps=500, beta1=1e-4, beta2=0.02,
-              checkpoint_save_dir=None, image_save_dir=None):
+          checkpoint_save_dir=None, image_save_dir=None):
         """Trains model for given inputs"""
-        self.nn_model.train()        
-        _ , _, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
+        self.nn_model.train()
+        _, _, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
         dataset = self.instantiate_dataset(self.dataset_name, 
                             self.get_transforms(self.dataset_name), self.file_dir)
         dataloader = self.initialize_dataloader(dataset, batch_size, self.checkpoint_name, self.file_dir)
@@ -33,7 +34,7 @@ class DiffusionModel(nn.Module):
         scheduler = self.initialize_scheduler(optim, self.checkpoint_name, self.file_dir, self.device)
 
         for epoch in range(self.get_start_epoch(self.checkpoint_name, self.file_dir), 
-                           self.get_start_epoch(self.checkpoint_name, self.file_dir) + n_epoch):
+                        self.get_start_epoch(self.checkpoint_name, self.file_dir) + n_epoch):
             ave_loss = 0
 
             for x, c in tqdm(dataloader, mininterval=2, desc=f"Epoch {epoch}"):
@@ -56,14 +57,28 @@ class DiffusionModel(nn.Module):
                 loss.backward()
                 optim.step()
 
-                ave_loss += loss.item()/len(dataloader)
+                ave_loss += loss.item() / len(dataloader)
+
             scheduler.step()
             print(f"Epoch: {epoch}, loss: {ave_loss}")
-            self.save_tensor_images(x, x_pert, self.get_x_unpert(x_pert, t, pred_noise, ab_t), 
-                                    epoch, self.file_dir, image_save_dir)
-            self.save_checkpoint(self.nn_model, optim, scheduler, epoch, ave_loss, 
-                                 timesteps, beta1, beta2, self.device, self.dataset_name,
-                                 dataloader.batch_size, self.file_dir, checkpoint_save_dir)
+
+            sample_size = min(8, x.shape[0]) 
+            self.save_tensor_images(
+                x[:sample_size],  
+                x_pert[:sample_size],  
+                self.get_x_unpert(x_pert[:sample_size], t[:sample_size], pred_noise[:sample_size], ab_t), 
+                c[:sample_size],  
+                epoch, 
+                self.file_dir,
+                image_save_dir
+            )
+
+            self.save_checkpoint(
+                self.nn_model, optim, scheduler, epoch, ave_loss, 
+                timesteps, beta1, beta2, self.device, self.dataset_name,
+                dataloader.batch_size, self.file_dir, checkpoint_save_dir
+            )
+
 
     @torch.no_grad()
     def sample_ddpm(self, n_samples, context=None, timesteps=None, 
@@ -108,38 +123,76 @@ class DiffusionModel(nn.Module):
     
     def instantiate_dataset(self, dataset_name, transforms, file_dir, train=True):
         """Returns instantiated dataset for given dataset name"""
-        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10"}, "Unknown dataset"
-        
+        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10", "custom"}, "Unknown dataset"
+
         transform, target_transform = transforms
-        if dataset_name=="mnist":
+        if dataset_name == "mnist":
             return MNIST(os.path.join(file_dir, "datasets"), train, transform, target_transform, True)
-        if dataset_name=="fashion_mnist":
+        if dataset_name == "fashion_mnist":
             return FashionMNIST(os.path.join(file_dir, "datasets"), train, transform, target_transform, True)
-        if dataset_name=="sprite":
+        if dataset_name == "sprite":
             return SpriteDataset(os.path.join(file_dir, "datasets"), transform, target_transform)
-        if dataset_name=="cifar10":
+        if dataset_name == "cifar10":
             return CIFAR10(os.path.join(file_dir, "datasets"), train, transform, target_transform, True)
+        if dataset_name == "custom":
+            from torch.utils.data import Dataset
+
+            class CustomDataset(Dataset):
+                def __init__(self, data_dir, transform=None, target_transform=None):
+                    self.data_dir = data_dir
+                    self.transform = transform
+                    self.target_transform = target_transform
+                    self.images = []
+                    self.labels = []
+
+                    for label in range(10):  # Assuming 10 classes (0-9)
+                        class_dir = os.path.join(data_dir, str(label))
+                        for file_name in os.listdir(class_dir):
+                            if file_name.endswith(".png") or file_name.endswith(".jpg"):
+                                self.images.append(os.path.join(class_dir, file_name))
+                                self.labels.append(label)
+
+                def __len__(self):
+                    return len(self.images)
+
+                def __getitem__(self, idx):
+                    from PIL import Image
+
+                    img_path = self.images[idx]
+                    label = self.labels[idx]
+
+                    image = Image.open(img_path).convert("RGB")
+                    if self.transform:
+                        image = self.transform(image)
+                    if self.target_transform:
+                        label = self.target_transform(label)
+
+                    return image, label
+
+            return CustomDataset(os.path.join(file_dir, "datasets", "processed_combination3"), transform, target_transform)
 
     def get_transforms(self, dataset_name):
         """Returns transform and target-transform for given dataset name"""
-        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10"}, "Unknown dataset"
+        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10", "custom"}, "Unknown dataset"
 
-        if dataset_name in {"mnist", "fashion_mnist", "cifar10"}:
+        if dataset_name in {"mnist", "fashion_mnist", "cifar10", "custom"}:
             transform = transforms.Compose([
-                transforms.ToTensor(),
-                lambda x: 2*(x - 0.5)
+                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((28, 28)),                
+                transforms.ToTensor()
             ])
             target_transform = transforms.Compose([
                 lambda x: torch.tensor([x]),
                 lambda class_labels, n_classes=10: nn.functional.one_hot(class_labels, n_classes).squeeze()
             ])
 
-        if dataset_name=="sprite":
+        if dataset_name == "sprite":
             transform = transforms.Compose([
                 transforms.ToTensor(),  # from [0,255] to range [0.0,1.0]
-                lambda x: 2*x - 1       # range [-1,1]
+                lambda x: 2 * x - 1       # range [-1,1]
             ])
             target_transform = lambda x: torch.from_numpy(x).to(torch.float32)
+
         return transform, target_transform
     
     def get_x_unpert(self, x_pert, t, pred_noise, ab_t):
@@ -148,20 +201,30 @@ class DiffusionModel(nn.Module):
     
     def initialize_nn_model(self, dataset_name, checkpoint_name, file_dir, device):
         """Returns the instantiated model based on dataset name"""
-        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10"}, "Unknown dataset name"
+        assert dataset_name in {"mnist", "fashion_mnist", "sprite", "cifar10", "custom"}, "Unknown dataset name"
 
         if dataset_name in {"mnist", "fashion_mnist"}:
             nn_model = ContextUnet(in_channels=1, height=28, width=28, n_feat=64, n_cfeat=10, n_downs=2)
-        elif dataset_name=="sprite":
+        elif dataset_name == "sprite":
             nn_model = ContextUnet(in_channels=3, height=16, width=16, n_feat=64, n_cfeat=5, n_downs=2)
         elif dataset_name == "cifar10":
             nn_model = ContextUnet(in_channels=3, height=32, width=32, n_feat=64, n_cfeat=10, n_downs=4)
+        elif dataset_name == "custom":
+            nn_model = ContextUnet(
+            in_channels=1,  
+            height=28,     
+            width=28,      
+            n_feat=64, 
+            n_cfeat=10, 
+            n_downs=2      
+        )
 
         if checkpoint_name:
             checkpoint = torch.load(os.path.join(file_dir, "checkpoints", checkpoint_name), map_location=device)
             nn_model.to(device)
             nn_model.load_state_dict(checkpoint["model_state_dict"])
             return nn_model
+
         return nn_model.to(device)
 
     def save_checkpoint(self, model, optimizer, scheduler, epoch, loss, 
@@ -219,15 +282,53 @@ class DiffusionModel(nn.Module):
         else:
             start_epoch = 0
         return start_epoch
-    
-    def save_tensor_images(self, x_orig, x_noised, x_denoised, cur_epoch, file_dir, save_dir):
-        """Saves given tensors as a single image"""
+
+    def save_tensor_images(self, x_orig, x_noised, x_denoised, labels, cur_epoch, file_dir, save_dir=None):
+        """
+        Saves all digits (0-9) in one combined image with titles indicating their labels.
+        """
         if save_dir is None:
-            fpath = os.path.join(file_dir, "saved-images", f"x_orig_noised_denoised_{cur_epoch}.jpeg")
-        else:
-            fpath = os.path.join(save_dir, f"x_orig_noised_denoised_{cur_epoch}.jpeg")
-        inference_transform = lambda x: (x + 1)/2
-        save_image([make_grid(inference_transform(img.detach())) for img in [x_orig, x_noised, x_denoised]], fpath)
+            save_dir = os.path.join("./saved-images", f"epoch_{cur_epoch}")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        inference_transform = lambda x: (x + 1) / 2
+
+        if isinstance(labels, torch.Tensor) and labels.dim() > 1:
+            labels = labels.argmax(dim=1)  
+        elif isinstance(labels, torch.Tensor) and labels.dim() == 0:
+            labels = labels.unsqueeze(0)  
+
+        fig, axes = plt.subplots(nrows=3, ncols=10, figsize=(15, 5)) 
+        fig.suptitle(f"Epoch {cur_epoch}: MNIST Digits", fontsize=16)
+
+        for i in range(10):
+            indices = (labels == i).nonzero(as_tuple=True)[0]
+            if len(indices) > 0: 
+                idx = indices[0]  
+                orig = inference_transform(x_orig[idx].detach().cpu())
+                noised = inference_transform(x_noised[idx].detach().cpu())
+                denoised = inference_transform(x_denoised[idx].detach().cpu())
+
+                axes[0, i].imshow(orig.permute(1, 2, 0), cmap="gray")
+                axes[0, i].set_title(f"Label {i}")
+                axes[0, i].axis("off")
+
+                axes[1, i].imshow(noised.permute(1, 2, 0), cmap="gray")
+                axes[1, i].axis("off")
+
+                axes[2, i].imshow(denoised.permute(1, 2, 0), cmap="gray")
+                axes[2, i].axis("off")
+            else:
+                for j in range(3):
+                    axes[j, i].axis("off")
+
+        save_path = os.path.join(save_dir, f"mnist_digits_epoch_{cur_epoch}.png")
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.85) 
+        plt.savefig(save_path)
+        plt.close(fig)
+
+
 
     def get_ddpm_noise_schedule(self, timesteps, beta1, beta2, device):
         """Returns ddpm noise schedule variables, a_t, b_t, ab_t
@@ -328,5 +429,3 @@ class DiffusionModel(nn.Module):
                            t_steps, 
                            os.path.join(root, f"{self.dataset_name}_ani.gif"),
                            n_images_per_row)
-
-
