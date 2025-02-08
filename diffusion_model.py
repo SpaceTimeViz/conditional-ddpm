@@ -79,7 +79,6 @@ class DiffusionModel(nn.Module):
                 dataloader.batch_size, self.file_dir, checkpoint_save_dir
             )
 
-
     @torch.no_grad()
     def sample_ddpm(self, n_samples, context=None, timesteps=None, 
                     beta1=None, beta2=None, save_rate=20, inference_transform=lambda x: (x+1)/2):
