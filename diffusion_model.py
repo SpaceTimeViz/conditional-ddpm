@@ -6,14 +6,14 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST, FashionMNIST, CIFAR10
 from tqdm import tqdm
 import os
-from models import ContextUnet
-from utils import SpriteDataset, generate_animation
+from .models import ContextUnet
+from .utils import SpriteDataset, generate_animation
 import matplotlib.pyplot as plt
 
 
 
 class DiffusionModel(nn.Module):
-    def __init__(self, device=None, dataset_name=None, checkpoint_name=None):
+    def __init__(self, device=None, dataset_name=None, checkpoint_name=None, num_classes=10):
         super(DiffusionModel, self).__init__()
         self.device = self.initialize_device(device)
         self.file_dir = os.path.dirname(__file__)
@@ -21,6 +21,7 @@ class DiffusionModel(nn.Module):
         self.checkpoint_name = checkpoint_name
         self.nn_model = self.initialize_nn_model(self.dataset_name, checkpoint_name, self.file_dir, self.device)
         self.create_dirs(self.file_dir)
+        self.num_classes = num_classes
 
     def train(self, batch_size=64, n_epoch=32, lr=1e-3, timesteps=500, beta1=1e-4, beta2=0.02,
           checkpoint_save_dir=None, image_save_dir=None):
@@ -83,39 +84,64 @@ class DiffusionModel(nn.Module):
 
 
     @torch.no_grad()
-    def sample_ddpm(self, n_samples, context=None, timesteps=None, 
-                    beta1=None, beta2=None, save_rate=20, inference_transform=lambda x: (x+1)/2):
-        """Returns the final denoised sample x0,
+    def sample_ddpm(self, n_samples, class_labels=None, timesteps=None, 
+                    beta1=None, beta2=None, save_rate=20, 
+                    inference_transform=lambda x: (x+1)/2):
+        """
+        Returns the final denoised sample x0,
         intermediate samples xT, xT-1, ..., x1, and
-        times tT, tT-1, ..., t1
+        times tT, tT-1, ..., t1.
+        
+        Args:
+            n_samples (int): Number of samples to generate.
+            class_labels (torch.Tensor): Class labels for conditional generation.
+            timesteps (int): Number of diffusion steps.
+            beta1 (float): Hyperparameter for noise schedule.
+            beta2 (float): Hyperparameter for noise schedule.
+            save_rate (int): Save interval for intermediate samples.
+            inference_transform (function): Function to normalize generated images.
+        
+        Returns:
+            final_samples, intermediate_samples, t_steps
         """
         if all([timesteps, beta1, beta2]):
             a_t, b_t, ab_t = self.get_ddpm_noise_schedule(timesteps, beta1, beta2, self.device)
         else:
             timesteps, a_t, b_t, ab_t = self.get_ddpm_params_from_checkpoint(self.file_dir,
-                                                                             self.checkpoint_name, 
-                                                                             self.device)
-        
+                                                                            self.checkpoint_name, 
+                                                                            self.device)
+
         self.nn_model.eval()
+
         samples = torch.randn(n_samples, self.nn_model.in_channels, 
-                              self.nn_model.height, self.nn_model.width, 
-                              device=self.device)
-        intermediate_samples = [samples.detach().cpu()] # samples at T = timesteps
-        t_steps = [timesteps] # keep record of time to use in animation generation
+                            self.nn_model.height, self.nn_model.width, 
+                            device=self.device)
+
+        if class_labels is not None:
+            class_labels = torch.nn.functional.one_hot(class_labels, num_classes=self.num_classes).float().to(self.device)
+
+        intermediate_samples = [samples.detach().cpu()]
+        t_steps = [timesteps]
+
         for t in range(timesteps, 0, -1):
             print(f"Sampling timestep {t}", end="\r")
-            if t % 50 == 0: print(f"Sampling timestep {t}")
+            if t % 50 == 0:
+                print(f"Sampling timestep {t}")
 
             z = torch.randn_like(samples) if t > 1 else 0
+            
             pred_noise = self.nn_model(samples, 
-                                       torch.tensor([t/timesteps], device=self.device)[:, None, None, None], 
-                                       context)
+                                    torch.tensor([t/timesteps], device=self.device)[:, None, None, None], 
+                                    class_labels)
+            
             samples = self.denoise_add_noise(samples, t, pred_noise, a_t, b_t, ab_t, z)
             
             if t % save_rate == 1 or t < 8:
                 intermediate_samples.append(inference_transform(samples.detach().cpu()))
                 t_steps.append(t-1)
+
         return intermediate_samples[-1], intermediate_samples, t_steps
+
 
     def perturb_input(self, x, t, noise, ab_t):
         """Perturbs given input
@@ -414,21 +440,21 @@ class DiffusionModel(nn.Module):
         context.extend([n_classes - 1]*(n_samples - len(context)))
         return torch.nn.functional.one_hot(torch.tensor(context), n_classes).float().to(device)
     
-    def generate(self, n_samples, n_images_per_row, timesteps, beta1, beta2):
-        """Generates x0 and intermediate samples xi via DDPM, 
-        and saves as jpeg and gif files for given inputs
+    def generate(self, n_samples, n_images_per_row, timesteps=None, beta1=None, beta2=None, class_labels=None):
         """
-        root = os.path.join(self.file_dir, "generated-images")
-        os.makedirs(root, exist_ok=True)
-        x0, intermediate_samples, t_steps = self.sample_ddpm(n_samples,
-                                                             self.get_custom_context(
-                                                                 n_samples, self.nn_model.n_cfeat, 
-                                                                 self.device),
-                                                             timesteps,
-                                                             beta1,
-                                                             beta2,)
-        save_image(x0, os.path.join(root, f"{self.dataset_name}_ddpm_images.jpeg"), nrow=n_images_per_row)
-        generate_animation(intermediate_samples,
-                           t_steps, 
-                           os.path.join(root, f"{self.dataset_name}_ani.gif"),
-                           n_images_per_row)
+        Generate samples from the diffusion model.
+
+        Args:
+            n_samples (int): Number of images to generate.
+            n_images_per_row (int): Grid row size.
+            timesteps (int, optional): Number of diffusion steps.
+            beta1 (float, optional): Noise schedule hyperparameter.
+            beta2 (float, optional): Noise schedule hyperparameter.
+            class_labels (torch.Tensor, optional): Class labels for conditional generation.
+        
+        Returns:
+            Generated images.
+        """
+        samples, _, _ = self.sample_ddpm(n_samples, class_labels=class_labels, timesteps=timesteps, beta1=beta1, beta2=beta2)
+        return samples
+
