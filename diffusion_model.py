@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST, FashionMNIST, CIFAR10
 from tqdm import tqdm
 import os
-from .models import ContextUnet
-from .utils import SpriteDataset, generate_animation
+from models import ContextUnet
+from utils import SpriteDataset, generate_animation
 import matplotlib.pyplot as plt
 
 
